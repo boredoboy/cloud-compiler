@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install psutil
           python -c "
-          import os, sys, json, base64, subprocess, urllib.request, zipfile, shutil, time, psutil
+          import os, sys, json, subprocess, urllib.request, zipfile, shutil, time, psutil
 
           # Чтение входных параметров
           with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
@@ -48,7 +48,7 @@ jobs:
           chat_id = payload['chat_id']
           bot_token = payload['bot_token']
           filename = payload['filename']
-          file_b64 = payload['file_b64']
+          file_url = payload['file_url']
           target_os = payload['os']
           mode = payload.get('mode', 'build')
 
@@ -79,9 +79,8 @@ jobs:
               except Exception as e: print('TG File Error:', e)
 
           try:
-              # Декодируем исходник
-              with open(filename, 'wb') as f:
-                  f.write(base64.b64decode(file_b64))
+              # Скачиваем файл по прямой ссылке с серверов Telegram
+              urllib.request.urlretrieve(file_url, filename)
 
               out_dir = os.path.abspath('dist')
               os.makedirs(out_dir, exist_ok=True)
@@ -92,16 +91,16 @@ jobs:
               main_executable = None
 
               # ==========================================
-              # 1. СБОРКА И КОМПИЛЯЦИЯ
+              # 1. СБОРКА / ОБРАБОТКА ФАЙЛА
               # ==========================================
+              if ext in ['.exe', '.bin', '.app']:
+                  main_executable = os.path.abspath(filename)
 
-              # Python
-              if ext == '.py':
+              elif ext == '.py':
                   subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
                   subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, filename], check=True)
                   main_executable = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
 
-              # C++
               elif ext in ['.cpp', '.cc', '.cxx']:
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   cmd = ['g++', '-O3', filename, '-o', out_name]
@@ -109,7 +108,6 @@ jobs:
                   subprocess.run(cmd, check=True)
                   main_executable = out_name
 
-              # C
               elif ext == '.c':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   cmd = ['gcc', '-O3', filename, '-o', out_name]
@@ -117,19 +115,16 @@ jobs:
                   subprocess.run(cmd, check=True)
                   main_executable = out_name
 
-              # Rust
               elif ext == '.rs':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   subprocess.run(['rustc', '-O', filename, '-o', out_name], check=True)
                   main_executable = out_name
 
-              # Go
               elif ext == '.go':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   subprocess.run(['go', 'build', '-o', out_name, filename], check=True)
                   main_executable = out_name
 
-              # C# (.cs)
               elif ext == '.cs':
                   proj_dir = os.path.abspath('csharp_proj')
                   os.makedirs(proj_dir, exist_ok=True)
@@ -137,9 +132,8 @@ jobs:
                   shutil.copy(filename, os.path.join(proj_dir, 'Program.cs'))
                   rid = 'win-x64' if is_win else ('osx-arm64' if is_mac else 'linux-x64')
                   subprocess.run(['dotnet', 'publish', proj_dir, '-c', 'Release', '-r', rid, '--self-contained', 'true', '-p:PublishSingleFile=true', '-o', out_dir], check=True)
-                  main_executable = os.path.join(out_dir, f'csharp_proj.exe' if is_win else 'csharp_proj')
+                  main_executable = os.path.join(out_dir, 'csharp_proj.exe' if is_win else 'csharp_proj')
 
-              # Java (.java)
               elif ext == '.java':
                   subprocess.run(['javac', filename], check=True)
                   class_file = f'{base_name}.class'
@@ -147,13 +141,11 @@ jobs:
                   subprocess.run(['jar', 'cfe', jar_file, base_name, class_file], check=True)
                   main_executable = jar_file
 
-              # Swift (.swift)
               elif ext == '.swift':
                   out_name = os.path.join(out_dir, base_name)
                   subprocess.run(['swiftc', filename, '-o', out_name], check=True)
                   main_executable = out_name
 
-              # ZIP Проект
               elif ext == '.zip':
                   zip_dir = os.path.abspath('extracted_project')
                   with zipfile.ZipFile(filename, 'r') as z:
@@ -167,19 +159,19 @@ jobs:
                           for f in files:
                               fn, fe = os.path.splitext(f)
                               fp = os.path.join(root, f)
-                              if fe == '.py':
-                                  subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, fp])
+                              if fe == '.py': subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, fp])
                               elif fe in ['.cpp', '.c']:
                                   o = os.path.join(out_dir, f'{fn}.exe' if is_win else fn)
-                                  subprocess.run(['g++', '-O3', fp, '-o', o])
+                                  cmd = ['g++', '-O3', fp, '-o', o]
+                                  if is_win: cmd.insert(2, '-static')
+                                  subprocess.run(cmd)
 
               # ==========================================
-              # 2. ПЕСОЧНИЦА И ДИНАМИЧЕСКИЙ АНАЛИЗ (ANY.RUN)
+              # 2. ПЕСОЧНИЦА (ANY.RUN АНАЛИЗ)
               # ==========================================
               if mode == 'test' and main_executable and os.path.exists(main_executable):
-                  send_tg_msg('🧪 <b>Запуск в песочнице...</b> Перехват вызовов, замер CPU/RAM и сетевой активности.')
+                  send_tg_msg('🧪 <b>Запуск в песочнице Any.Run...</b> Сбор метрик CPU/RAM, сети и логов.')
                   
-                  # Подготовка команды запуска
                   exec_cmd = [main_executable]
                   if main_executable.endswith('.jar'):
                       exec_cmd = ['java', '-jar', main_executable]
@@ -192,12 +184,10 @@ jobs:
                   peak_ram_mb = 0.0
                   net_connections = set()
 
-                  # Запуск процесса в песочнице с ограничением по времени
                   proc = subprocess.Popen(exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                   p = psutil.Process(proc.pid)
 
-                  # Мониторинг активности
-                  for _ in range(50): # до 5 секунд мониторинга
+                  for _ in range(50):
                       if proc.poll() is not None:
                           break
                       try:
@@ -210,7 +200,6 @@ jobs:
                       except Exception:
                           pass
 
-                  # Если процесс завис / ждет ввода — корректно глушим
                   if proc.poll() is None:
                       proc.terminate()
                       try: proc.wait(timeout=2)
@@ -221,9 +210,8 @@ jobs:
                   exit_code = proc.returncode
 
                   after_files = set(os.listdir('.')) - before_files
-                  created_files = [f for f in after_files if f not in ['dist', filename, 'build']]
+                  created_files = [f for f in after_files if f not in ['dist', filename, 'build', 'extracted_project']]
 
-                  # Формирование отчета Any.Run
                   report_text = f'''==================================================
            DIHANT CLOUD SANDBOX REPORT
 ==================================================
@@ -254,7 +242,6 @@ Created Files   : {len(created_files)}
                   with open('sandbox_report.txt', 'w', encoding='utf-8') as rf:
                       rf.write(report_text)
 
-                  # Краткий отчет в Telegram
                   summary = (
                       f'🔬 <b>ANY.RUN SANDBOX REPORT</b>\n'
                       f'━━━━━━━━━━━━━━━━━━━━\n'
@@ -265,12 +252,12 @@ Created Files   : {len(created_files)}
                       f'• 💾 <b>RAM Peak:</b> <code>{peak_ram_mb:.2f} MB</code>\n\n'
                       f'🌐 <b>Сеть:</b> <code>{len(net_connections)} сокетов</code>\n'
                       f'📁 <b>Файлы:</b> <code>{len(created_files)} создано</code>\n\n'
-                      f'📄 <i>Полный дамп прикреплен в файле ниже.</i>'
+                      f'📄 <i>Полный лог прикреплен файлом.</i>'
                   )
                   send_tg_file('sandbox_report.txt', summary)
 
               # ==========================================
-              # 3. ОТПРАВКА СКОМПИЛИРОВАННЫХ АРТЕФАКТОВ
+              # 3. ОТПРАВКА СКОМПИЛИРОВАННЫХ ФАЙЛОВ
               # ==========================================
               artifacts = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if not f.startswith('.')]
               if artifacts:
@@ -280,7 +267,7 @@ Created Files   : {len(created_files)}
                       b_zip = 'compiled_bundle.zip'
                       with zipfile.ZipFile(b_zip, 'w') as zf:
                           for a in artifacts: zf.write(a, os.path.basename(a))
-                      send_tg_file(b_zip, f'🚀 <b>Сборка завершена (архив файлов)!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>')
+                      send_tg_file(b_zip, f'🚀 <b>Сборка завершена (архив)!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>')
 
           except Exception as e:
               send_tg_msg(f'❌ <b>Ошибка выполнения:</b>\n<code>{str(e)}</code>')
