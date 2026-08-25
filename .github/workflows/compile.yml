@@ -1,0 +1,163 @@
+name: Cloud Compiler Engine
+
+on:
+  repository_dispatch:
+    types: [compile]
+
+jobs:
+  build:
+    runs-on: ${{ github.event.client_payload.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Universal Build & Send to Telegram
+        shell: bash
+        run: |
+          python -c "
+          import os, sys, json, base64, subprocess, urllib.request, zipfile, shutil
+
+          # 1. Читаем данные от бота
+          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
+              event = json.load(f)
+          payload = event['client_payload']
+          chat_id = payload['chat_id']
+          bot_token = payload['bot_token']
+          filename = payload['filename']
+          file_b64 = payload['file_b64']
+          target_os = payload['os']
+
+          def send_tg_msg(text):
+              url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+              data = json.dumps({'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}).encode()
+              req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+              try: urllib.request.urlopen(req)
+              except Exception as e: print('TG Error:', e)
+
+          def send_tg_file(filepath, caption=''):
+              boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+              url = f'https://api.telegram.org/bot{bot_token}/sendDocument'
+              with open(filepath, 'rb') as f:
+                  file_data = f.read()
+              fname = os.path.basename(filepath)
+              body = []
+              body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n'.encode())
+              if caption:
+                  body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n'.encode())
+                  body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n'.encode())
+              body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode())
+              body.append(file_data)
+              body.append(f'\r\n--{boundary}--\r\n'.encode())
+              req = urllib.request.Request(url, data=b''.join(body))
+              req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+              urllib.request.urlopen(req)
+
+          try:
+              # Декодируем входящий файл
+              with open(filename, 'wb') as f:
+                  f.write(base64.b64decode(file_b64))
+
+              out_dir = os.path.abspath('dist')
+              os.makedirs(out_dir, exist_ok=True)
+              base_name, ext = os.path.splitext(filename)
+              ext = ext.lower()
+              is_win = 'windows' in target_os.lower()
+
+              # Python (.py)
+              if ext == '.py':
+                  subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
+                  subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, filename], check=True)
+
+              # C++ (.cpp)
+              elif ext in ['.cpp', '.cc', '.cxx']:
+                  out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
+                  cmd = ['g++', '-O3', filename, '-o', out_name]
+                  if is_win: cmd.insert(2, '-static')
+                  subprocess.run(cmd, check=True)
+
+              # C (.c)
+              elif ext == '.c':
+                  out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
+                  cmd = ['gcc', '-O3', filename, '-o', out_name]
+                  if is_win: cmd.insert(2, '-static')
+                  subprocess.run(cmd, check=True)
+
+              # Rust (.rs)
+              elif ext == '.rs':
+                  out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
+                  subprocess.run(['rustc', '-O', filename, '-o', out_name], check=True)
+
+              # Go (.go)
+              elif ext == '.go':
+                  out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
+                  subprocess.run(['go', 'build', '-o', out_name, filename], check=True)
+
+              # ZIP проект
+              elif ext == '.zip':
+                  zip_dir = os.path.abspath('extracted_project')
+                  with zipfile.ZipFile(filename, 'r') as zip_ref:
+                      zip_ref.extractall(zip_dir)
+                  
+                  if os.path.exists(os.path.join(zip_dir, 'CMakeLists.txt')):
+                      b_dir = os.path.join(zip_dir, 'build')
+                      subprocess.run(['cmake', '-B', b_dir, '-S', zip_dir], check=True)
+                      subprocess.run(['cmake', '--build', b_dir, '--config', 'Release'], check=True)
+                      for root, _, files in os.walk(b_dir):
+                          for fl in files:
+                              if fl.endswith(('.exe', '.bin')) or ('.' not in fl and not is_win):
+                                  shutil.copy(os.path.join(root, fl), out_dir)
+                  elif os.path.exists(os.path.join(zip_dir, 'main.py')):
+                      subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
+                      req = os.path.join(zip_dir, 'requirements.txt')
+                      if os.path.exists(req):
+                          subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', req])
+                      subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, os.path.join(zip_dir, 'main.py')], check=True)
+                  else:
+                      # Пакетная сборка отдельных файлов
+                      subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'])
+                      for root, _, files in os.walk(zip_dir):
+                          for f in files:
+                              fn, fe = os.path.splitext(f)
+                              fp = os.path.join(root, f)
+                              if fe == '.py': subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, fp])
+                              elif fe in ['.cpp', '.cc']:
+                                  o = os.path.join(out_dir, f'{fn}.exe' if is_win else fn)
+                                  cmd = ['g++', '-O3', fp, '-o', o]
+                                  if is_win: cmd.insert(2, '-static')
+                                  subprocess.run(cmd)
+                              elif fe == '.c':
+                                  o = os.path.join(out_dir, f'{fn}.exe' if is_win else fn)
+                                  cmd = ['gcc', '-O3', fp, '-o', o]
+                                  if is_win: cmd.insert(2, '-static')
+                                  subprocess.run(cmd)
+
+              # Отправляем готовые файлы
+              artifacts = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if not f.startswith('.')]
+              if not artifacts:
+                  send_tg_msg('⚠️ Сборка прошла, но исполняемый файл не был создан.')
+                  sys.exit(1)
+
+              if len(artifacts) == 1:
+                  send_tg_file(artifacts[0], f'🚀 <b>Сборка завершена!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>\n📦 <b>Исходник:</b> <code>{filename}</code>')
+              else:
+                  b_zip = 'compiled_bundle.zip'
+                  with zipfile.ZipFile(b_zip, 'w') as zf:
+                      for a in artifacts: zf.write(a, os.path.basename(a))
+                  send_tg_file(b_zip, f'🚀 <b>Сборка завершена (архив файлов)!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>\n📦 <b>Исходник:</b> <code>{filename}</code>')
+
+          except Exception as e:
+              send_tg_msg(f'❌ <b>Ошибка компиляции:</b>\n<code>{str(e)}</code>')
+              raise e
+          "
