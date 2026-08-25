@@ -23,234 +23,141 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup .NET (C#)
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Setup Java (JDK)
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Universal Build & Dynamic Sandbox Engine
+      - name: Universal Build & Send to Telegram
         shell: bash
         run: |
-          pip install psutil
+          python -c "
+          import os, sys, json, base64, subprocess, urllib.request, zipfile, shutil
 
-          cat << 'EOF' > runner.py
-          import os, sys, json, base64, subprocess, urllib.request, zipfile, shutil, time, psutil
-
+          # 1. Читаем данные от бота
           with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
               event = json.load(f)
           payload = event['client_payload']
-          chat_id = str(payload['chat_id'])
+          chat_id = payload['chat_id']
           bot_token = payload['bot_token']
           filename = payload['filename']
-          file_b64 = payload.get('file_b64', '')
-          file_url = payload.get('file_url', '')
+          file_b64 = payload['file_b64']
           target_os = payload['os']
-          mode = payload.get('mode', 'build')
 
           def send_tg_msg(text):
-              subprocess.run([
-                  'curl', '-s', '-X', 'POST',
-                  f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                  '-d', f'chat_id={chat_id}',
-                  '-d', f'text={text}',
-                  '-d', 'parse_mode=HTML'
-              ])
+              url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+              data = json.dumps({'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}).encode()
+              req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+              try: urllib.request.urlopen(req)
+              except Exception as e: print('TG Error:', e)
 
           def send_tg_file(filepath, caption=''):
-              cmd = [
-                  'curl', '-s', '-X', 'POST',
-                  f'https://api.telegram.org/bot{bot_token}/sendDocument',
-                  '-F', f'chat_id={chat_id}',
-                  '-F', f'document=@{filepath}'
-              ]
+              boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+              url = f'https://api.telegram.org/bot{bot_token}/sendDocument'
+              with open(filepath, 'rb') as f:
+                  file_data = f.read()
+              fname = os.path.basename(filepath)
+              body = []
+              body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n'.encode())
               if caption:
-                  cmd.extend(['-F', f'caption={caption}', '-F', 'parse_mode=HTML'])
-              subprocess.run(cmd)
+                  body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n'.encode())
+                  body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n'.encode())
+              body.append(f'--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode())
+              body.append(file_data)
+              body.append(f'\r\n--{boundary}--\r\n'.encode())
+              req = urllib.request.Request(url, data=b''.join(body))
+              req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+              urllib.request.urlopen(req)
 
           try:
-              # Получение исходного файла
-              if file_b64:
-                  with open(filename, 'wb') as f:
-                      f.write(base64.b64decode(file_b64))
-              elif file_url:
-                  req = urllib.request.Request(file_url, headers={'User-Agent': 'Mozilla/5.0'})
-                  with urllib.request.urlopen(req) as resp, open(filename, 'wb') as out:
-                      out.write(resp.read())
+              # Декодируем входящий файл
+              with open(filename, 'wb') as f:
+                  f.write(base64.b64decode(file_b64))
 
               out_dir = os.path.abspath('dist')
               os.makedirs(out_dir, exist_ok=True)
               base_name, ext = os.path.splitext(filename)
               ext = ext.lower()
               is_win = 'windows' in target_os.lower()
-              is_mac = 'macos' in target_os.lower()
-              main_executable = None
 
-              # 1. КОМПИЛЯЦИЯ
-              if ext in ['.exe', '.bin', '.app']:
-                  main_executable = os.path.abspath(filename)
-
-              elif ext == '.py':
+              # Python (.py)
+              if ext == '.py':
                   subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
                   subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, filename], check=True)
-                  main_executable = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
 
+              # C++ (.cpp)
               elif ext in ['.cpp', '.cc', '.cxx']:
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   cmd = ['g++', '-O3', filename, '-o', out_name]
                   if is_win: cmd.insert(2, '-static')
                   subprocess.run(cmd, check=True)
-                  main_executable = out_name
 
+              # C (.c)
               elif ext == '.c':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   cmd = ['gcc', '-O3', filename, '-o', out_name]
                   if is_win: cmd.insert(2, '-static')
                   subprocess.run(cmd, check=True)
-                  main_executable = out_name
 
+              # Rust (.rs)
               elif ext == '.rs':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   subprocess.run(['rustc', '-O', filename, '-o', out_name], check=True)
-                  main_executable = out_name
 
+              # Go (.go)
               elif ext == '.go':
                   out_name = os.path.join(out_dir, f'{base_name}.exe' if is_win else base_name)
                   subprocess.run(['go', 'build', '-o', out_name, filename], check=True)
-                  main_executable = out_name
 
-              elif ext == '.cs':
-                  p_dir = os.path.abspath('cs_proj')
-                  os.makedirs(p_dir, exist_ok=True)
-                  subprocess.run(['dotnet', 'new', 'console', '-o', p_dir, '--force'], check=True)
-                  shutil.copy(filename, os.path.join(p_dir, 'Program.cs'))
-                  rid = 'win-x64' if is_win else ('osx-arm64' if is_mac else 'linux-x64')
-                  subprocess.run(['dotnet', 'publish', p_dir, '-c', 'Release', '-r', rid, '--self-contained', 'true', '-p:PublishSingleFile=true', '-o', out_dir], check=True)
-                  main_executable = os.path.join(out_dir, 'cs_proj.exe' if is_win else 'cs_proj')
-
-              elif ext == '.java':
-                  subprocess.run(['javac', filename], check=True)
-                  jar_f = os.path.join(out_dir, f'{base_name}.jar')
-                  subprocess.run(['jar', 'cfe', jar_f, base_name, f'{base_name}.class'], check=True)
-                  main_executable = jar_f
-
-              elif ext == '.swift':
-                  out_name = os.path.join(out_dir, base_name)
-                  subprocess.run(['swiftc', filename, '-o', out_name], check=True)
-                  main_executable = out_name
-
+              # ZIP проект
               elif ext == '.zip':
-                  z_dir = os.path.abspath('zip_src')
-                  with zipfile.ZipFile(filename, 'r') as z: z.extractall(z_dir)
-                  if os.path.exists(os.path.join(z_dir, 'main.py')):
+                  zip_dir = os.path.abspath('extracted_project')
+                  with zipfile.ZipFile(filename, 'r') as zip_ref:
+                      zip_ref.extractall(zip_dir)
+                  
+                  if os.path.exists(os.path.join(zip_dir, 'CMakeLists.txt')):
+                      b_dir = os.path.join(zip_dir, 'build')
+                      subprocess.run(['cmake', '-B', b_dir, '-S', zip_dir], check=True)
+                      subprocess.run(['cmake', '--build', b_dir, '--config', 'Release'], check=True)
+                      for root, _, files in os.walk(b_dir):
+                          for fl in files:
+                              if fl.endswith(('.exe', '.bin')) or ('.' not in fl and not is_win):
+                                  shutil.copy(os.path.join(root, fl), out_dir)
+                  elif os.path.exists(os.path.join(zip_dir, 'main.py')):
                       subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'], check=True)
-                      subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, os.path.join(z_dir, 'main.py')], check=True)
-                      main_executable = os.path.join(out_dir, 'main.exe' if is_win else 'main')
+                      req = os.path.join(zip_dir, 'requirements.txt')
+                      if os.path.exists(req):
+                          subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', req])
+                      subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, os.path.join(zip_dir, 'main.py')], check=True)
                   else:
-                      for root, _, files in os.walk(z_dir):
+                      # Пакетная сборка отдельных файлов
+                      subprocess.run([sys.executable, '-m', 'pip', 'install', 'pyinstaller'])
+                      for root, _, files in os.walk(zip_dir):
                           for f in files:
                               fn, fe = os.path.splitext(f)
                               fp = os.path.join(root, f)
                               if fe == '.py': subprocess.run(['pyinstaller', '--onefile', '--distpath', out_dir, fp])
-                              elif fe in ['.cpp', '.c']:
+                              elif fe in ['.cpp', '.cc']:
                                   o = os.path.join(out_dir, f'{fn}.exe' if is_win else fn)
                                   cmd = ['g++', '-O3', fp, '-o', o]
                                   if is_win: cmd.insert(2, '-static')
                                   subprocess.run(cmd)
+                              elif fe == '.c':
+                                  o = os.path.join(out_dir, f'{fn}.exe' if is_win else fn)
+                                  cmd = ['gcc', '-O3', fp, '-o', o]
+                                  if is_win: cmd.insert(2, '-static')
+                                  subprocess.run(cmd)
 
-              # 2. ПЕСОЧНИЦА / ТЕСТИРОВАНИЕ
-              if mode == 'test' and main_executable and os.path.exists(main_executable):
-                  send_tg_msg('🧪 <b>Запуск в песочнице Any.Run...</b> Анализ поведения и замер ресурсов.')
-                  
-                  cmd_run = [main_executable]
-                  if main_executable.endswith('.jar'): cmd_run = ['java', '-jar', main_executable]
-                  if not is_win: os.chmod(main_executable, 0o755)
-
-                  start_t = time.time()
-                  peak_cpu = 0.0
-                  peak_ram = 0.0
-                  sockets = set()
-
-                  proc = subprocess.Popen(cmd_run, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                  try:
-                      p = psutil.Process(proc.pid)
-                      for _ in range(40):
-                          if proc.poll() is not None: break
-                          try:
-                              c = p.cpu_percent(interval=0.1)
-                              r = p.memory_info().rss / (1024 * 1024)
-                              if c > peak_cpu: peak_cpu = c
-                              if r > peak_ram: peak_ram = r
-                              for conn in p.connections(kind='inet'):
-                                  sockets.add(f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else f"Port {conn.laddr.port}")
-                          except Exception: pass
-                  except Exception: pass
-
-                  if proc.poll() is None:
-                      proc.terminate()
-                      try: proc.wait(timeout=2)
-                      except Exception: proc.kill()
-
-                  dur = time.time() - start_t
-                  out_txt, err_txt = proc.communicate()
-                  code = proc.returncode
-
-                  rep = f"""==================================================
-           DIHANT CLOUD SANDBOX REPORT
-==================================================
-Object      : {os.path.basename(main_executable)}
-Target OS   : {target_os}
-Duration    : {dur:.2f} s
-Exit Code   : {code}
-
-[RESOURCES]
-Peak CPU    : {peak_cpu:.1f}%
-Peak RAM    : {peak_ram:.2f} MB
-
-[NETWORK ACTIVITY]
-Connections : {len(sockets)} detected
-{chr(10).join(['  -> ' + s for s in sockets]) if sockets else '  -> No outbound sockets'}
-
-[STDOUT]
-{out_txt.strip() if out_txt.strip() else '[No output]'}
-
-[STDERR]
-{err_txt.strip() if err_txt.strip() else '[No errors]'}
-=================================================="""
-                  with open('report.txt', 'w', encoding='utf-8') as rf: rf.write(rep)
-                  
-                  summary = (
-                      f"🔬 <b>ANY.RUN SANDBOX REPORT</b>\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"📦 <b>Объект:</b> <code>{os.path.basename(main_executable)}</code>\n"
-                      f"⏱️ <b>Время:</b> <code>{dur:.2f}s</code> | <b>Exit Code:</b> <code>{code}</code>\n\n"
-                      f"📊 <b>Ресурсы:</b>\n"
-                      f"• 🧠 <b>CPU:</b> <code>{peak_cpu:.1f}%</code>\n"
-                      f"• 💾 <b>RAM:</b> <code>{peak_ram:.2f} MB</code>\n"
-                      f"🌐 <b>Сеть:</b> <code>{len(sockets)} соединений</code>\n\n"
-                      f"📄 <i>Полный лог прикреплен файлом ниже.</i>"
-                  )
-                  send_tg_file('report.txt', summary)
-
-              # 3. ОТПРАВКА БИНАРНИКОВ
+              # Отправляем готовые файлы
               artifacts = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if not f.startswith('.')]
-              if artifacts:
-                  if len(artifacts) == 1:
-                      send_tg_file(artifacts[0], f"🚀 <b>Готово!</b> Цель: <code>{target_os}</code>")
-                  else:
-                      z_out = 'compiled_bundle.zip'
-                      with zipfile.ZipFile(z_out, 'w') as zf:
-                          for a in artifacts: zf.write(a, os.path.basename(a))
-                      send_tg_file(z_out, f"🚀 <b>Сборка завершена (архив)!</b>")
+              if not artifacts:
+                  send_tg_msg('⚠️ Сборка прошла, но исполняемый файл не был создан.')
+                  sys.exit(1)
+
+              if len(artifacts) == 1:
+                  send_tg_file(artifacts[0], f'🚀 <b>Сборка завершена!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>\n📦 <b>Исходник:</b> <code>{filename}</code>')
+              else:
+                  b_zip = 'compiled_bundle.zip'
+                  with zipfile.ZipFile(b_zip, 'w') as zf:
+                      for a in artifacts: zf.write(a, os.path.basename(a))
+                  send_tg_file(b_zip, f'🚀 <b>Сборка завершена (архив файлов)!</b>\n💻 <b>Цель:</b> <code>{target_os}</code>\n📦 <b>Исходник:</b> <code>{filename}</code>')
 
           except Exception as e:
-              send_tg_msg(f"❌ <b>Ошибка:</b>\n<code>{str(e)}</code>")
+              send_tg_msg(f'❌ <b>Ошибка компиляции:</b>\n<code>{str(e)}</code>')
               raise e
-          EOF
-
-          python runner.py
+          "
