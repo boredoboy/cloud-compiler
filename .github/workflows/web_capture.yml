@@ -2,7 +2,7 @@ name: Web Capture Engine
 
 on:
   repository_dispatch:
-    types: [web_capture] # Этот Action реагирует только на эту команду
+    types: [web_capture]
 
 jobs:
   capture:
@@ -15,6 +15,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Устанавливаем конвертер видео (FFmpeg)
+      - name: Install System Dependencies (FFmpeg)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install Playwright & Dependencies
         run: |
           pip install playwright requests
@@ -24,16 +28,15 @@ jobs:
         shell: bash
         run: |
           python -c "
-          import os, json, time, requests
+          import os, json, time, requests, subprocess
           from playwright.sync_api import sync_playwright
 
-          # Читаем данные от бота
           with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
               event = json.load(f)
           
           payload = event['client_payload']
           url = payload['url']
-          mode = payload['mode'] # 'screenshot' или 'video'
+          mode = payload['mode']
           chat_id = payload['chat_id']
           bot_token = payload['bot_token']
 
@@ -46,17 +49,22 @@ jobs:
                   requests.post(f'https://api.telegram.org/bot{bot_token}/sendDocument',
                                 data={'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'},
                                 files={'document': doc})
+                                
+          # Специальный метод для отправки играбельного видео
+          def send_tg_video(filepath, caption):
+              with open(filepath, 'rb') as vid:
+                  requests.post(f'https://api.telegram.org/bot{bot_token}/sendVideo',
+                                data={'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'},
+                                files={'video': vid})
 
           try:
               if not url.startswith('http'):
                   url = 'https://' + url
 
               with sync_playwright() as p:
-                  # Настраиваем виртуальный браузер (Full HD экран)
                   browser = p.chromium.launch(headless=True)
                   
                   if mode == 'video':
-                      # Включаем запись видео
                       context = browser.new_context(
                           viewport={'width': 1920, 'height': 1080},
                           record_video_dir='videos/',
@@ -65,7 +73,6 @@ jobs:
                       page = context.new_page()
                       page.goto(url, wait_until='networkidle', timeout=60000)
                       
-                      # Скрипт для плавного скроллинга страницы вниз
                       page.evaluate('''
                           async () => {
                               await new Promise((resolve) => {
@@ -83,30 +90,35 @@ jobs:
                               });
                           }
                       ''')
-                      time.sleep(1) # Ждем секунду после скролла
+                      time.sleep(1)
                       
-                      # Закрываем контекст, чтобы видео сохранилось
                       context.close()
                       browser.close()
                       
-                      # Находим записанное видео
-                      video_file = os.path.join('videos', os.listdir('videos')[0])
+                      # Ищем записанный WEBM
+                      webm_file = os.path.join('videos', os.listdir('videos')[0])
+                      mp4_file = 'output_video.mp4'
                       
-                      # Отправляем в ТГ
-                      send_tg_document(video_file, f'🎥 <b>Скролл сайта:</b> {url}')
+                      # Конвертируем WEBM в MP4 (H.264) через FFmpeg для Телеграма
+                      subprocess.run([
+                          'ffmpeg', '-i', webm_file, 
+                          '-c:v', 'libx264', '-preset', 'fast', '-crf', '24', 
+                          '-pix_fmt', 'yuv420p', mp4_file
+                      ], check=True)
+                      
+                      # Отправляем видео
+                      send_tg_video(mp4_file, f'🎥 <b>Скролл сайта:</b> {url}')
 
                   elif mode == 'screenshot':
                       context = browser.new_context(viewport={'width': 1920, 'height': 1080})
                       page = context.new_page()
                       page.goto(url, wait_until='networkidle', timeout=60000)
                       
-                      # Делаем скриншот ВСЕЙ страницы (от верха до низа)
                       pic_path = 'screenshot.png'
                       page.screenshot(path=pic_path, full_page=True)
                       
                       browser.close()
                       
-                      # Отправляем в ТГ
                       send_tg_document(pic_path, f'📸 <b>Скриншот сайта:</b> {url}')
 
           except Exception as e:
