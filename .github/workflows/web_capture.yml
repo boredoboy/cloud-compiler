@@ -1,0 +1,75 @@
+name: Web Capture Bot
+
+# Запускается по API (как и твой компилятор)
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Ссылка на сайт'
+        required: true
+      chat_id:
+        description: 'ID чата, куда скинуть результат'
+        required: true
+      mode:
+        description: 'Режим: screenshot или video'
+        default: 'video'
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Запуск браузера, записи и отправка в Telegram
+        env:
+          # Токен бота берем из секретов репозитория
+          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          URL: ${{ github.event.inputs.url }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          mkdir -p out
+          
+          if [ "$MODE" == "screenshot" ]; then
+            echo "Делаем скриншот сайта..."
+            # Для скриншота даже не нужен виртуальный экран, Chromium умеет это сам в headless-режиме
+            docker run --rm -v $(pwd)/out:/out -e URL="$URL" debian:bookworm-slim bash -c '
+              apt-get update -qq && apt-get install -y -qq chromium > /dev/null
+              chromium --no-sandbox --headless --window-size=1280,1024 --screenshot=/out/result.png "$URL" 2>/dev/null
+            '
+            # Отправляем фото напрямую в телегу
+            curl -F chat_id="$CHAT_ID" -F photo=@out/result.png "https://api.telegram.org/bot$BOT_TOKEN/sendPhoto"
+          
+          else
+            echo "Записываем видео со скроллингом..."
+            # Поднимаем Xvfb, FFmpeg и браузер
+            docker run --rm -v $(pwd)/out:/out -e URL="$URL" debian:bookworm-slim bash -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq xvfb chromium xdotool ffmpeg curl > /dev/null
+              
+              echo "Запуск виртуального монитора..."
+              Xvfb :99 -screen 0 1280x1024x24 &
+              export DISPLAY=:99
+              sleep 2
+              
+              echo "Старт записи экрана..."
+              ffmpeg -y -f x11grab -video_size 1280x1024 -i :99.0 -codec:v libx264 -preset ultrafast -pix_fmt yuv420p /out/result.mp4 > /dev/null 2>&1 &
+              REC_PID=$!
+              
+              echo "Открытие сайта..."
+              # Запускаем в режиме киоска (без рамок браузера)
+              chromium --no-sandbox --window-size=1280,1024 --kiosk "$URL" > /dev/null 2>&1 &
+              sleep 6 # Ждем прогрузки страницы
+              
+              echo "Имитация скроллинга..."
+              for i in {1..15}; do
+                xdotool key Down
+                sleep 0.4
+              done
+              sleep 2
+              
+              echo "Сохранение видео..."
+              kill -INT $REC_PID
+              sleep 3
+            '
+            # Отправляем готовое видео напрямую в телегу
+            curl -F chat_id="$CHAT_ID" -F video=@out/result.mp4 "https://api.telegram.org/bot$BOT_TOKEN/sendVideo"
+          fi
