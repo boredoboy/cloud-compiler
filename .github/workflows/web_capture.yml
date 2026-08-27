@@ -1,75 +1,114 @@
-name: Web Capture Bot
+name: Web Capture Engine
 
-# Запускается по API (как и твой компилятор)
 on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: 'Ссылка на сайт'
-        required: true
-      chat_id:
-        description: 'ID чата, куда скинуть результат'
-        required: true
-      mode:
-        description: 'Режим: screenshot или video'
-        default: 'video'
+  repository_dispatch:
+    types: [web_capture] # Этот Action реагирует только на эту команду
 
 jobs:
   capture:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Запуск браузера, записи и отправка в Telegram
-        env:
-          # Токен бота берем из секретов репозитория
-          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          URL: ${{ github.event.inputs.url }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          MODE: ${{ github.event.inputs.mode }}
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright & Dependencies
         run: |
-          mkdir -p out
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Run Web Capture & Send to Telegram
+        shell: bash
+        run: |
+          python -c "
+          import os, json, time, requests
+          from playwright.sync_api import sync_playwright
+
+          # Читаем данные от бота
+          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
+              event = json.load(f)
           
-          if [ "$MODE" == "screenshot" ]; then
-            echo "Делаем скриншот сайта..."
-            # Для скриншота даже не нужен виртуальный экран, Chromium умеет это сам в headless-режиме
-            docker run --rm -v $(pwd)/out:/out -e URL="$URL" debian:bookworm-slim bash -c '
-              apt-get update -qq && apt-get install -y -qq chromium > /dev/null
-              chromium --no-sandbox --headless --window-size=1280,1024 --screenshot=/out/result.png "$URL" 2>/dev/null
-            '
-            # Отправляем фото напрямую в телегу
-            curl -F chat_id="$CHAT_ID" -F photo=@out/result.png "https://api.telegram.org/bot$BOT_TOKEN/sendPhoto"
-          
-          else
-            echo "Записываем видео со скроллингом..."
-            # Поднимаем Xvfb, FFmpeg и браузер
-            docker run --rm -v $(pwd)/out:/out -e URL="$URL" debian:bookworm-slim bash -c '
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq && apt-get install -y -qq xvfb chromium xdotool ffmpeg curl > /dev/null
-              
-              echo "Запуск виртуального монитора..."
-              Xvfb :99 -screen 0 1280x1024x24 &
-              export DISPLAY=:99
-              sleep 2
-              
-              echo "Старт записи экрана..."
-              ffmpeg -y -f x11grab -video_size 1280x1024 -i :99.0 -codec:v libx264 -preset ultrafast -pix_fmt yuv420p /out/result.mp4 > /dev/null 2>&1 &
-              REC_PID=$!
-              
-              echo "Открытие сайта..."
-              # Запускаем в режиме киоска (без рамок браузера)
-              chromium --no-sandbox --window-size=1280,1024 --kiosk "$URL" > /dev/null 2>&1 &
-              sleep 6 # Ждем прогрузки страницы
-              
-              echo "Имитация скроллинга..."
-              for i in {1..15}; do
-                xdotool key Down
-                sleep 0.4
-              done
-              sleep 2
-              
-              echo "Сохранение видео..."
-              kill -INT $REC_PID
-              sleep 3
-            '
-            # Отправляем готовое видео напрямую в телегу
-            curl -F chat_id="$CHAT_ID" -F video=@out/result.mp4 "https://api.telegram.org/bot$BOT_TOKEN/sendVideo"
-          fi
+          payload = event['client_payload']
+          url = payload['url']
+          mode = payload['mode'] # 'screenshot' или 'video'
+          chat_id = payload['chat_id']
+          bot_token = payload['bot_token']
+
+          def send_tg_message(text):
+              requests.post(f'https://api.telegram.org/bot{bot_token}/sendMessage', 
+                            data={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'})
+
+          def send_tg_document(filepath, caption):
+              with open(filepath, 'rb') as doc:
+                  requests.post(f'https://api.telegram.org/bot{bot_token}/sendDocument',
+                                data={'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'},
+                                files={'document': doc})
+
+          try:
+              if not url.startswith('http'):
+                  url = 'https://' + url
+
+              with sync_playwright() as p:
+                  # Настраиваем виртуальный браузер (Full HD экран)
+                  browser = p.chromium.launch(headless=True)
+                  
+                  if mode == 'video':
+                      # Включаем запись видео
+                      context = browser.new_context(
+                          viewport={'width': 1920, 'height': 1080},
+                          record_video_dir='videos/',
+                          record_video_size={'width': 1920, 'height': 1080}
+                      )
+                      page = context.new_page()
+                      page.goto(url, wait_until='networkidle', timeout=60000)
+                      
+                      # Скрипт для плавного скроллинга страницы вниз
+                      page.evaluate('''
+                          async () => {
+                              await new Promise((resolve) => {
+                                  let totalHeight = 0;
+                                  let distance = 150;
+                                  let timer = setInterval(() => {
+                                      let scrollHeight = document.body.scrollHeight;
+                                      window.scrollBy(0, distance);
+                                      totalHeight += distance;
+                                      if (totalHeight >= scrollHeight - window.innerHeight || totalHeight > 15000) {
+                                          clearInterval(timer);
+                                          resolve();
+                                      }
+                                  }, 100);
+                              });
+                          }
+                      ''')
+                      time.sleep(1) # Ждем секунду после скролла
+                      
+                      # Закрываем контекст, чтобы видео сохранилось
+                      context.close()
+                      browser.close()
+                      
+                      # Находим записанное видео
+                      video_file = os.path.join('videos', os.listdir('videos')[0])
+                      
+                      # Отправляем в ТГ
+                      send_tg_document(video_file, f'🎥 <b>Скролл сайта:</b> {url}')
+
+                  elif mode == 'screenshot':
+                      context = browser.new_context(viewport={'width': 1920, 'height': 1080})
+                      page = context.new_page()
+                      page.goto(url, wait_until='networkidle', timeout=60000)
+                      
+                      # Делаем скриншот ВСЕЙ страницы (от верха до низа)
+                      pic_path = 'screenshot.png'
+                      page.screenshot(path=pic_path, full_page=True)
+                      
+                      browser.close()
+                      
+                      # Отправляем в ТГ
+                      send_tg_document(pic_path, f'📸 <b>Скриншот сайта:</b> {url}')
+
+          except Exception as e:
+              send_tg_message(f'❌ <b>Ошибка обработки сайта:</b>\n<code>{str(e)}</code>')
+          "
