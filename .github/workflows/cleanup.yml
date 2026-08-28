@@ -1,0 +1,21 @@
+name: Уборщик логов Actions (Cleanup)
+
+on:
+  workflow_dispatch: # Позволяет запускать очистку вручную по кнопке
+  schedule:
+    - cron: '0 0 * * 0' # Автоматически убираться каждое воскресенье ночью (по желанию)
+
+jobs:
+  del_runs:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # Даем боту права на удаление логов
+      
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0         # Удалять вообще всё (0 дней хранения)
+          keep_minimum_runs: 0   # Не оставлять даже последних успешных
