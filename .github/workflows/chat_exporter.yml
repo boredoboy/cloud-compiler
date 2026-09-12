@@ -1,0 +1,107 @@
+name: Telegram Chat Exporter
+
+on:
+  repository_dispatch:
+    types: [export_chat]
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Pyrogram & Dependencies
+        run: pip install pyrogram tgcrypto requests
+
+      - name: Execute Chat Export
+        env:
+          API_ID: ${{ secrets.TG_API_ID }}
+          API_HASH: ${{ secrets.TG_API_HASH }}
+          SESSION: ${{ secrets.TG_SESSION }}
+          TARGET: ${{ github.event.client_payload.target }}
+          FORMAT: ${{ github.event.client_payload.format }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          BOT_TOKEN: ${{ github.event.client_payload.bot_token }}
+        run: |
+          python -c "
+          import os, asyncio, json, requests
+          from pyrogram import Client
+
+          API_ID = int(os.environ['API_ID'])
+          API_HASH = os.environ['API_HASH']
+          SESSION = os.environ['SESSION']
+          TARGET = os.environ['TARGET']
+          FORMAT = os.environ.get('FORMAT', 'txt').lower()
+          CHAT_ID = os.environ['CHAT_ID']
+          BOT_TOKEN = os.environ['BOT_TOKEN']
+
+          app = Client('memory_export', session_string=SESSION, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+
+          def notify_bot(text):
+              requests.post(
+                  f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                  json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
+              )
+
+          async def run_export():
+              async with app:
+                  try:
+                      chat = await app.get_chat(TARGET)
+                      title = chat.title or chat.first_name or TARGET
+                      print(f'Экспорт чата: {title}')
+
+                      messages = []
+                      async for msg in app.get_chat_history(chat.id):
+                          text = msg.text or msg.caption or ''
+                          if not text:
+                              if msg.photo: text = '[Фото]'
+                              elif msg.video: text = '[Видео]'
+                              elif msg.voice: text = '[Голосовое сообщение]'
+                              elif msg.document: text = '[Документ]'
+                              elif msg.sticker: text = '[Стикер]'
+                              else: continue
+
+                          date_str = msg.date.strftime('%Y-%m-%d %H:%M:%S')
+                          sender = 'Я' if msg.from_user and msg.from_user.is_self else (msg.from_user.first_name if msg.from_user else 'Пользователь')
+
+                          if FORMAT == 'json':
+                              messages.append({'date': date_str, 'sender': sender, 'text': text})
+                          else:
+                              messages.append(f'[{date_str}] {sender}: {text}\n')
+
+                      if not messages:
+                          notify_bot(f'⚠️ В чате <b>{title}</b> не найдено текстовых сообщений.')
+                          return
+
+                      messages.reverse()
+
+                      safe_name = ''.join(c for c in title if c.isalnum() or c in (' ', '_', '-')).strip()
+                      filename = f'Export_{safe_name}.{FORMAT}'
+
+                      if FORMAT == 'json':
+                          with open(filename, 'w', encoding='utf-8') as f:
+                              json.dump(messages, f, ensure_ascii=False, indent=2)
+                      else:
+                          with open(filename, 'w', encoding='utf-8') as f:
+                              f.writelines(messages)
+
+                      # Отправка файла в твоё Избранное от твоего имени
+                      await app.send_document(
+                          'me',
+                          document=filename,
+                          caption=f'📁 <b>Экспорт чата:</b> <code>{title}</code>\n⚙️ <b>Формат:</b> <code>{FORMAT.upper()}</code>\n💬 <b>Сообщений:</b> <code>{len(messages)}</code>'
+                      )
+
+                      notify_bot(f'✅ <b>Экспорт чата «{title}» готов!</b>\nФайл отправлен в твоё <b>Избранное (Saved Messages)</b>.')
+                      os.remove(filename)
+
+                  except Exception as e:
+                      notify_bot(f'❌ <b>Ошибка при экспорте:</b>\n<code>{str(e)}</code>')
+
+          asyncio.run(run_export())
+          "
