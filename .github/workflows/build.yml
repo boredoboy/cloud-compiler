@@ -1,0 +1,62 @@
+name: Build APK from ZIP
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # кнопка "Run workflow"
+
+jobs:
+  build:
+    name: Unzip + Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and unzip blackhole-android.zip
+        run: |
+          echo "Looking for zip..."
+          find . -name "blackhole-android.zip" -type f
+          ZIP_FILE=$(find . -name "blackhole-android.zip" -type f | head -1)
+          
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: blackhole-android.zip not found in repository!"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Found: $ZIP_FILE"
+          unzip -o "$ZIP_FILE"
+          echo "Unzipped successfully"
+          ls -la
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build Debug APK
+        working-directory: blackhole-android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackhole-apk
+          path: blackhole-android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Show result
+        run: |
+          echo "=== APK files ==="
+          find blackhole-android/app/build/outputs -name "*.apk" -ls || echo "No APK found"
